@@ -13,14 +13,21 @@ def load_image_from_bytes(data: bytes) -> np.ndarray:
 
 
 def preprocess(img: np.ndarray) -> np.ndarray:
-    """Convierte a escala de grises y aplica Sobel para obtener mapa de bordes."""
+    """
+    MEJORA: Canny en lugar de Sobel + threshold fijo.
+    
+    El código original usaba Sobel con threshold binario fijo (30).
+    Problema: imágenes con bajo brillo/contraste no generaban gradientes
+    superiores a 30 y perdían todos sus bordes → falsos negativos totales.
+    
+    Canny usa histéresis adaptativa (dos umbrales) + supresión no-máxima,
+    detectando bordes débiles conectados a fuertes sin romper contornos.
+    Internamente usa Sobel, así que la filosofía del paper se conserva.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    sx = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
-    sy = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
-    mag = np.sqrt(sx**2 + sy**2)
-    mag = np.uint8(255 * mag / mag.max())
-    _, edge = cv2.threshold(mag, 30, 255, cv2.THRESH_BINARY)
+    # Umbrales bajos para capturar bordes débiles sin fragmentar continuos
+    edge = cv2.Canny(blur, threshold1=30, threshold2=90)
     return edge
 
 
