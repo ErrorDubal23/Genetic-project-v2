@@ -9,67 +9,54 @@ import numpy as np
 import base64
 
 # ── Configuración general ─────────────────────────────────────────────────────
-KERNEL_DESENFOQUE    = (5, 5)  # Tamaño del filtro de suavizado para reducir ruido
-MAX_PUNTOS_BORDE     = 5000    # Límite de puntos que le pasamos al GA.
-                                # MEJORA: antes 3000, ahora 5000.
-                                # Con solo 3000, círculos pequeños en imágenes
-                                # densas se perdían porque sus puntos eran
-                                # eliminados en el muestreo aleatorio.
+KERNEL_DESENFOQUE    = (5, 5)
+MAX_PUNTOS_BORDE     = 5000    # Aumentado para no perder círculos pequeños
 
 # ── Configuración de la supresión de líneas rectas ────────────────────────────
-BRECHA_MAXIMA_LINEA  = 5   # MEJORA: antes 8, ahora 5.
-                            # Con 8px, HoughLinesP conectaba segmentos
-                            # separados por mucho espacio, tratando bordes
-                            # curvos fragmentados como una "línea recta"
-                            # continua y eliminándolos por error.
-
-GROSOR_MASCARA_LINEA = 4   # MEJORA: antes 7, ahora 4.
-                            # 7px borraba demasiado ancho, destruyendo
-                            # bordes de círculos grandes que localmente
-                            # tienen segmentos casi rectos. 4px es suficiente
-                            # para tapar líneas reales sin dañar curvas.
-
+# MEJORA PROFUNDA: estos valores ahora son MÁS CONSERVADORES.
+# El problema original: la supresión de líneas rectas era tan agresiva que
+# eliminaba bordes de círculos grandes (cuyo borde localmente parece recto)
+# y bordes de círculos cercanos a líneas.
+BRECHA_MAXIMA_LINEA  = 4     # Antes 8, luego 5. Ahora 4: menos conexiones falsas
+GROSOR_MASCARA_LINEA = 3     # Antes 7, luego 4. Ahora 3: borra menos ancho
 
 # ── Cargar imagen ─────────────────────────────────────────────────────────────
 
 def cargar_imagen_desde_bytes(datos_imagen: bytes) -> np.ndarray:
-    """
-    Convierte los bytes del archivo subido en una imagen que podamos procesar.
-    Si el archivo no es una imagen válida, lanza un error explicando el problema.
-    """
     arreglo_bytes = np.frombuffer(datos_imagen, np.uint8)
     imagen = cv2.imdecode(arreglo_bytes, cv2.IMREAD_COLOR)
-
     if imagen is None:
         raise ValueError("No se pudo decodificar la imagen. Verifica que el formato sea válido.")
-
     return imagen
 
 
 # ── Eliminar líneas rectas del mapa de bordes ─────────────────────────────────
 
-def suprimir_lineas_rectas(mapa_bordes: np.ndarray, forma_imagen: tuple) -> np.ndarray:
+def suprimir_lineas_rectas(mapa_bordes: np.ndarray, forma_imagen: tuple,
+                           habilitar: bool = True) -> np.ndarray:
     """
-    Detecta y borra los segmentos de línea recta del mapa de bordes, para que
-    el GA solo vea bordes curvos (que son los que forman círculos).
+    MEJORA PROFUNDA: la supresión de líneas ahora es MÁS CONSERVADORA.
 
-    Los lados de triángulos, rectángulos y pentágonos son líneas rectas.
-    Los bordes de los círculos son curvos. Esta función elimina las líneas rectas
-    antes de que el GA las confunda con partes de un círculo.
+    El problema original: con GROSOR_MASCARA_LINEA=7 y maxLineGap=8, esta función
+    eliminaba bordes de círculos legítimos porque:
+    1. Los bordes de círculos grandes tienen segmentos LOCALMENTE rectos
+    2. HoughLinesP conectaba puntos separados por 8px, formando "líneas" falsas
+    3. La máscara de 7px de grosro destruía bordes de círculos cercanos
 
-    El umbral de longitud mínima se calcula automáticamente según el tamaño de
-    la imagen, porque en imágenes grandes los círculos también son grandes y
-    sus bordes parecen más rectos localmente. Si usáramos un umbral fijo,
-    eliminaríamos bordes de círculos grandes por error.
+    Ahora:
+    - maxLineGap=4: no conecta segmentos separados por mucho espacio
+    - GROSOR_MASCARA_LINEA=3: borra solo lo necesario
+    - longitud_min más conservadora: no detecta bordes curvos como rectos
     """
+    if not habilitar:
+        return mapa_bordes
+
     alto, ancho = forma_imagen[:2]
-    diagonal    = math.sqrt(alto ** 2 + ancho ** 2)
+    diagonal = math.sqrt(alto ** 2 + ancho ** 2)
 
-    # MEJORA: antes diagonal*0.18 = 144px para 640x480. Con esa longitud,
-    # círculos grandes (r > 80px) podían tener bordes locales detectados
-    # como líneas rectas. Ahora 0.15 = 120px, más conservador.
-    longitud_min =  max(50, int(diagonal * 0.15))
-    umbral_votos = max(20, int(longitud_min * 0.55))
+    # Mucho más conservador: solo líneas MUY largas y MUY rectas
+    longitud_min = max(80, int(diagonal * 0.20))
+    umbral_votos = max(30, int(longitud_min * 0.6))
 
     lineas = cv2.HoughLinesP(
         mapa_bordes,
@@ -81,9 +68,8 @@ def suprimir_lineas_rectas(mapa_bordes: np.ndarray, forma_imagen: tuple) -> np.n
     )
 
     if lineas is None:
-        return mapa_bordes  # No se encontraron líneas rectas, nada que borrar
+        return mapa_bordes
 
-    # Dibujamos un "borrador" sobre cada línea detectada y lo aplicamos
     mascara = np.zeros_like(mapa_bordes)
     for linea in lineas:
         x1, y1, x2, y2 = linea[0]
@@ -94,46 +80,39 @@ def suprimir_lineas_rectas(mapa_bordes: np.ndarray, forma_imagen: tuple) -> np.n
 
 # ── Preparar la imagen para el GA ────────────────────────────────────────────
 
-def preprocesar(imagen: np.ndarray) -> np.ndarray:
+def preprocesar(imagen: np.ndarray, suprimir_lineas: bool = True) -> np.ndarray:
     """
-    Transforma la imagen original en un mapa de bordes que el GA pueda usar.
+    MEJORA PROFUNDA: Preprocesado adaptativo con menos destrucción de bordes.
 
-    Los pasos son:
-      1. Convertir a escala de grises (el GA no necesita color).
-      2. Suavizar para reducir el ruido de la textura.
-      3. Detectar los bordes con Canny.
-      4. Borrar las líneas rectas para que queden principalmente bordes curvos.
+    El problema original: Canny con umbrales basados en percentiles funcionaba
+    bien para imágenes "típicas", pero en imágenes con:
+    - Bajo contraste: los percentiles bajos generaban demasiados bordes espurios
+    - Alto ruido: la mediana era muy alta, eliminando bordes reales
+    - Círculos de color similar al fondo: los gradientes eran débiles
 
-    Los umbrales de Canny los calculamos a partir de la fuerza real de los bordes
-    en la imagen (no del brillo de los píxeles). Esto hace que funcione bien tanto
-    en imágenes oscuras como en imágenes con fondo blanco, donde los círculos de
-    colores claros tienen bordes más suaves que los oscuros.
+    Solución: usar un enfoque más robusto basado en la magnitud del gradiente.
     """
-    gris      = cv2.cvtColor(imagen, cv2.COLOR_BGR2GRAY)
-    # MEJORA: sigma=0 en lugar de sigma=2.
-    # Con sigma=2, GaussianBlur difuminaba demasiado los bordes finos,
-    # especialmente de círculos pequeños o con poco contraste.
-    # sigma=0 calcula automáticamente según el tamaño del kernel (5x5),
-    # preservando bordes más finos sin aumentar el ruido.
+    gris = cv2.cvtColor(imagen, cv2.COLOR_BGR2GRAY)
     suavizada = cv2.GaussianBlur(gris, KERNEL_DESENFOQUE, 0)
 
-    # Calculamos qué tan fuertes son los gradientes (cambios de color) en la imagen
+    # Gradientes
     gx = cv2.Sobel(suavizada, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(suavizada, cv2.CV_64F, 0, 1, ksize=3)
     magnitud = np.hypot(gx, gy)
 
-    # Usamos los percentiles de esa fuerza para fijar los umbrales de Canny
+    # Umbrales adaptativos más robustos
     valores_grad = magnitud[magnitud > 0].ravel()
     if len(valores_grad) > 100:
-        mediana_grad = float(np.median(valores_grad))
-        p85_grad     = float(np.percentile(valores_grad, 85))
-        umbral_bajo  = max(10, int(mediana_grad * 0.4))
-        umbral_alto  = max(umbral_bajo + 30, int(p85_grad))
+        # Usar percentiles más conservadores
+        p25 = float(np.percentile(valores_grad, 25))
+        p75 = float(np.percentile(valores_grad, 75))
+        umbral_bajo = max(15, int(p25 * 0.5))
+        umbral_alto = max(umbral_bajo + 20, int(p75 * 0.8))
     else:
         umbral_bajo, umbral_alto = 30, 100
 
     mapa_bordes = cv2.Canny(suavizada, umbral_bajo, umbral_alto)
-    mapa_bordes = suprimir_lineas_rectas(mapa_bordes, imagen.shape)
+    mapa_bordes = suprimir_lineas_rectas(mapa_bordes, imagen.shape, suprimir_lineas)
 
     return mapa_bordes
 
@@ -142,35 +121,69 @@ def preprocesar(imagen: np.ndarray) -> np.ndarray:
 
 def obtener_puntos_borde(mapa_bordes: np.ndarray) -> np.ndarray:
     """
-    Convierte el mapa de bordes en una lista de coordenadas (x, y).
-    Si hay demasiados puntos, tomamos una muestra aleatoria para que el GA
-    no se vuelva lento.
+    MEJORA PROFUNDA: estratificación espacial para preservar círculos pequeños.
+
+    El problema original: muestreo aleatorio de 5000 puntos podía eliminar
+    TODOS los puntos de un círculo pequeño si había muchos bordes en otras
+    partes de la imagen.
+
+    Solución: dividir la imagen en una cuadrícula y asegurar que cada celda
+    contribuya proporcionalmente. Esto preserva círculos pequeños incluso
+    cuando hay muchos bordes en otras zonas.
     """
     filas, columnas = np.where(mapa_bordes > 0)
-    puntos_borde    = np.column_stack((columnas, filas)).astype(np.float64)
+    puntos_borde = np.column_stack((columnas, filas)).astype(np.float64)
 
-    if len(puntos_borde) > MAX_PUNTOS_BORDE:
-        indices_muestra = np.random.choice(len(puntos_borde), MAX_PUNTOS_BORDE, replace=False)
-        puntos_borde    = puntos_borde[indices_muestra]
+    n = len(puntos_borde)
+    if n <= MAX_PUNTOS_BORDE:
+        return puntos_borde
 
-    return puntos_borde
+    # Estratificación espacial: dividir en cuadrícula 4x4
+    alto, ancho = mapa_bordes.shape
+    celdas = []
+    for i in range(4):
+        for j in range(4):
+            y0, y1 = int(alto * i / 4), int(alto * (i + 1) / 4)
+            x0, x1 = int(ancho * j / 4), int(ancho * (j + 1) / 4)
+            mask = ((puntos_borde[:, 0] >= x0) & (puntos_borde[:, 0] < x1) &
+                    (puntos_borde[:, 1] >= y0) & (puntos_borde[:, 1] < y1))
+            celdas.append(puntos_borde[mask])
+
+    # Tomar muestras proporcionales de cada celda
+    puntos_muestra = []
+    puntos_por_celda = MAX_PUNTOS_BORDE // 16
+
+    for celda in celdas:
+        if len(celda) == 0:
+            continue
+        if len(celda) <= puntos_por_celda:
+            puntos_muestra.append(celda)
+        else:
+            indices = np.random.choice(len(celda), puntos_por_celda, replace=False)
+            puntos_muestra.append(celda[indices])
+
+    # Si sobran puntos, llenar con aleatorios globales
+    resultado = np.vstack(puntos_muestra) if puntos_muestra else np.array([])
+    if len(resultado) < MAX_PUNTOS_BORDE and n > 0:
+        faltan = MAX_PUNTOS_BORDE - len(resultado)
+        indices_extra = np.random.choice(n, min(faltan, n), replace=False)
+        resultado = np.vstack([resultado, puntos_borde[indices_extra]])
+
+    return resultado
 
 
 # ── Dibujar los círculos detectados sobre la imagen ──────────────────────────
 
 def anotar_imagen(imagen: np.ndarray, circulos: list) -> np.ndarray:
-    """
-    Dibuja cada círculo detectado encima de la imagen original para visualizarlo.
-    """
     imagen_anotada = imagen.copy()
 
     for circulo in circulos:
         centro_x = int(circulo["x"])
         centro_y = int(circulo["y"])
-        radio    = int(circulo["r"])
+        radio = int(circulo["r"])
 
         cv2.circle(imagen_anotada, (centro_x, centro_y), radio, (255, 255, 255), 2)
-        cv2.circle(imagen_anotada, (centro_x, centro_y), 3,     (200, 200, 200), -1)
+        cv2.circle(imagen_anotada, (centro_x, centro_y), 3, (200, 200, 200), -1)
 
     return imagen_anotada
 
@@ -178,10 +191,6 @@ def anotar_imagen(imagen: np.ndarray, circulos: list) -> np.ndarray:
 # ── Convertir la imagen a texto para enviarla al frontend ─────────────────────
 
 def imagen_a_base64(imagen: np.ndarray) -> str:
-    """
-    Convierte la imagen a formato base64 para que el frontend pueda mostrarla
-    directamente sin necesidad de guardar un archivo.
-    """
-    _, buffer  = cv2.imencode(".png", imagen)
+    _, buffer = cv2.imencode(".png", imagen)
     cadena_b64 = base64.b64encode(buffer.tobytes()).decode()
     return cadena_b64
