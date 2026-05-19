@@ -1,26 +1,16 @@
 """
-GA mejorado para detección de círculos.
-Basado en Ayala-Ramírez et al. (2006) + mejoras de robustez.
+GA para detección de círculos – mejoras conservadoras sobre el código original.
 
-CAMBIOS CLAVE respecto a v1 (original):
-1. Distance Transform precomputado: fitness 100x más rápida que cKDTree.
-2. Fitness híbrida (circunferencia + inliers): precisión del paper sin fragilidad.
-3. Canonicalización de cromosomas: reduce espacio de búsqueda (simetría i,j,k).
-4. NMS con AND lógico (posición Y radio): evita duplicados sin matar círculos cercanos.
-5. top_k=1 por defecto: evita falsos positivos de detección múltiple.
-6. Elitismo eficiente: evalúa offspring una sola vez por generación.
-
-CAMBIOS CLAVE respecto a v2 (fallido):
-- Quitado min_circumference_ratio DURO que eliminaba círculos válidos.
-- Quitado cKDTree que hacía cada imagen tardar minutos.
-- Quitado occlusion_penalty mal diseñado que destruía fitness en bordes de imagen.
-- Radio mínimo vuelve a 5.0 (como original), no 8.0.
-- delta por defecto 2.0 (como original), no 1.5.
-- Fitness híbrida: no depende solo del muestreo de circunferencia.
+MEJORAS:
+1. Detección multi-círculo: extrae círculos secuenciales eliminando inliers
+   del círculo detectado, como propone el paper (Sección 3.1.4).
+2. Cromosomas sin repetición: evita individuos degenerados como (5,5,8).
+3. Canonicalización: ordena i≤j≤k para que (3,5,8)=(5,3,8), reduciendo
+   el espacio de búsqueda ~6×.
+4. Evaluación de offspring 1 sola vez por generación (antes se evaluaba 2×).
 """
 import numpy as np
 from fitness import evaluate_fitness, circle_from_three_points
-from scipy import ndimage
 
 
 class GeneticCircleDetector:
@@ -31,55 +21,35 @@ class GeneticCircleDetector:
         mutation_prob: float = 0.10,
         elite_count: int = 2,
         max_generations: int = 500,
-        min_radius: float = 5.0,
-        max_radius: float = None,
-        fitness_delta: float = 2.0,
-        nms_threshold: float = 15.0,
-        top_k: int = 1,
-        fitness_threshold: float = 0.10,
+        top_k: int = 5,
+        fitness_threshold: float = 0.01,
     ):
         self.pop_size = population_size
         self.pc = crossover_prob
         self.pm = mutation_prob
         self.elite = elite_count
         self.max_gen = max_generations
-        self.min_radius = min_radius
-        self.max_radius = max_radius
-        self.fitness_delta = fitness_delta
-        self.nms_threshold = nms_threshold
         self.top_k = top_k
         self.fitness_threshold = fitness_threshold
 
     # ------------------------------------------------------------------
     def _init_population(self, n_points: int) -> np.ndarray:
-        """Población sin índices repetidos por individuo."""
+        """Población donde cada individuo tiene 3 índices distintos."""
         pop = np.zeros((self.pop_size, 3), dtype=np.int64)
         for i in range(self.pop_size):
             pop[i] = np.random.choice(n_points, size=3, replace=False)
         return pop
 
     def _canonicalize(self, pop):
-        """
-        Ordena los 3 genes de menor a mayor.
-        (i,j,k), (j,i,k), (k,j,i) codifican el MISMO círculo.
-        Ordenar elimina esta simetría y reduce el espacio de búsqueda.
-        """
+        """Ordena genes i≤j≤k para eliminar simetría de permutación."""
         return np.sort(pop, axis=1)
 
-    def _evaluate(self, pop, edge_points, img_shape, dt):
-        return np.array([
-            evaluate_fitness(
-                ind, edge_points, img_shape, dt,
-                delta=self.fitness_delta,
-                min_radius=self.min_radius,
-                max_radius=self.max_radius,
-            )
-            for ind in pop
-        ])
+    def _evaluate(self, pop, edge_points, img_shape, delta):
+        return np.array([evaluate_fitness(ind, edge_points, img_shape, delta) for ind in pop])
 
     def _roulette_select(self, pop, fitnesses):
         total = fitnesses.sum()
-        if total <= 1e-12:
+        if total == 0:
             probs = np.ones(len(pop)) / len(pop)
         else:
             probs = fitnesses / total
@@ -98,60 +68,49 @@ class GeneticCircleDetector:
         return self._canonicalize(new_pop)
 
     def _mutate(self, pop, n_points):
+        """Mutación que evita repetir índices dentro del mismo individuo."""
         for i in range(self.pop_size):
             if np.random.rand() < self.pm:
                 gene = np.random.randint(3)
-                pop[i, gene] = np.random.randint(n_points)
+                existing = set(pop[i])
+                candidates = [c for c in range(n_points) if c not in existing]
+                if candidates:
+                    pop[i, gene] = np.random.choice(candidates)
+                else:
+                    pop[i, gene] = np.random.randint(n_points)
         return self._canonicalize(pop)
 
-    def _non_max_suppression(self, candidates):
-        """
-        Supresión no-máxima: dos círculos son duplicados solo si son similares
-        en posición Y radio simultáneamente (AND lógico).
-        Esto evita que círculos reales cercanos sean fusionados por error.
-        """
+    def _nms(self, candidates):
+        """Supresión no-máxima: conserva círculos no superpuestos en posición+radio."""
         if not candidates:
             return []
         candidates = sorted(candidates, key=lambda x: x["fitness"], reverse=True)
         keep = []
         for c in candidates:
-            overlap = False
+            dup = False
             for k in keep:
                 d = np.hypot(c["x"] - k["x"], c["y"] - k["y"])
-                dr = abs(c["r"] - k["r"])
-                if d < self.nms_threshold and dr < (self.nms_threshold / 2):
-                    overlap = True
+                if d < 15 or abs(c["r"] - k["r"]) < 10:
+                    dup = True
                     break
-            if not overlap:
+            if not dup:
                 keep.append(c)
                 if len(keep) >= self.top_k:
                     break
         return keep
 
     # ------------------------------------------------------------------
-    def detect(self, edge_points: np.ndarray, img_shape: tuple,
-               edge_map: np.ndarray = None) -> dict:
+    def _run_ga(self, edge_points, img_shape, delta):
+        """Una ejecución del GA. Devuelve (círculo_mejor, fitness_mejor)."""
         n = len(edge_points)
         if n < 3:
-            return {"circles": [], "best_fitness": 0.0}
-
-        # Precomputar Distance Transform UNA SOLA VEZ por imagen.
-        # dt[y, x] = distancia del píxel (y,x) al borde más cercano.
-        # Esto reemplaza cKDTree (lento) con lookup O(1) vectorizado.
-        if edge_map is None:
-            # Fallback: reconstruir edge_map desde edge_points
-            edge_map = np.zeros(img_shape[:2], dtype=np.uint8)
-            if n > 0:
-                xi = np.clip(edge_points[:, 0].astype(int), 0, img_shape[1] - 1)
-                yi = np.clip(edge_points[:, 1].astype(int), 0, img_shape[0] - 1)
-                edge_map[yi, xi] = 255
-        dt = ndimage.distance_transform_edt(edge_map == 0)
+            return None, 0.0
 
         pop = self._init_population(n)
         best_ind, best_fit = None, -1.0
 
         for _ in range(self.max_gen):
-            fits = self._evaluate(pop, edge_points, img_shape, dt)
+            fits = self._evaluate(pop, edge_points, img_shape, delta)
 
             # Elitismo
             elite_idx = np.argsort(fits)[-self.elite:]
@@ -168,46 +127,55 @@ class GeneticCircleDetector:
             offspring = self._mutate(offspring, n)
 
             # Reemplazar peores offspring con élites (evaluar offspring 1 sola vez)
-            offspring_fits = self._evaluate(offspring, edge_points, img_shape, dt)
-            worst_idx = np.argsort(offspring_fits)[:self.elite]
+            off_fits = self._evaluate(offspring, edge_points, img_shape, delta)
+            worst_idx = np.argsort(off_fits)[:self.elite]
             for k, wi in enumerate(worst_idx):
                 offspring[wi] = elites[k]
 
             pop = self._canonicalize(offspring)
 
-        # Extraer múltiples círculos candidatos de la población final
-        circles = []
-        final_fits = self._evaluate(pop, edge_points, img_shape, dt)
-        seen = set()
+        if best_ind is None or best_fit <= self.fitness_threshold:
+            return None, best_fit
 
-        for idx in np.argsort(final_fits)[::-1]:
-            fit = final_fits[idx]
-            if fit < self.fitness_threshold:
+        p1, p2, p3 = edge_points[best_ind[0]], edge_points[best_ind[1]], edge_points[best_ind[2]]
+        result = circle_from_three_points(p1, p2, p3)
+        if result is None:
+            return None, best_fit
+
+        cx, cy, r = result
+        return {"x": round(float(cx), 2), "y": round(float(cy), 2),
+                "r": round(float(r), 2), "fitness": round(float(best_fit), 4)}, best_fit
+
+    def detect(self, edge_points: np.ndarray, img_shape: tuple,
+                delta: float = 2.0) -> dict:
+        """
+        Detección multi-círculo:
+        1. Ejecuta GA, extrae mejor círculo.
+        2. Elimina edge_points que son inliers de ese círculo (los 'consume').
+        3. Repite mientras queden ≥3 puntos y fitness > umbral.
+        4. Aplica NMS por si quedaron duplicados.
+        """
+        remaining = edge_points.copy()
+        all_circles = []
+        global_best = 0.0
+
+        for _ in range(self.top_k):
+            if len(remaining) < 3:
                 break
-            ind = tuple(pop[idx])
-            if ind in seen:
-                continue
-            seen.add(ind)
 
-            p1, p2, p3 = edge_points[ind[0]], edge_points[ind[1]], edge_points[ind[2]]
-            result = circle_from_three_points(p1, p2, p3)
-            if result is None:
-                continue
-            cx, cy, r = result
-
-            circles.append({
-                "x": round(float(cx), 2),
-                "y": round(float(cy), 2),
-                "r": round(float(r), 2),
-                "fitness": round(float(fit), 4),
-            })
-
-            if len(circles) >= self.top_k * 3:
+            circle, fit = self._run_ga(remaining, img_shape, delta)
+            if circle is None or fit <= self.fitness_threshold:
                 break
 
-        circles = self._non_max_suppression(circles)
+            all_circles.append(circle)
+            if fit > global_best:
+                global_best = fit
 
-        return {
-            "circles": circles,
-            "best_fitness": round(float(best_fit), 4) if best_fit > 0 else 0.0,
-        }
+            # Eliminar inliers del círculo detectado para buscar el siguiente
+            cx, cy, r = circle["x"], circle["y"], circle["r"]
+            dists = np.abs(np.sqrt((remaining[:, 0] - cx)**2 + (remaining[:, 1] - cy)**2) - r)
+            inliers = dists <= delta * 2.5  # margen generoso para no fragmentar círculos
+            remaining = remaining[~inliers]
+
+        all_circles = self._nms(all_circles)
+        return {"circles": all_circles, "best_fitness": round(float(global_best), 4)}
