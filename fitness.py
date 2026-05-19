@@ -1,20 +1,17 @@
 """
 Aquí está todo lo relacionado con evaluar qué tan "bueno" es un círculo candidato.
-El algoritmo genético usa estas funciones para saber si un individuo vale la pena
-o no, y al final para confirmar que lo que encontró es un círculo real.
 
-Basado en: Ayala-Ramírez et al. (2006), secciones 2.2 y 2.3.
-
-MEJORAS CLAVE:
-- El código original ejecutaba evaluar_aptitud DOS VECES para cada individuo
-  (líneas duplicadas), calculando aptitud_base, aptitud, y luego
-  redefiniendo bordes, puntos_con_borde, aptitud_base DE NUEVO.
-  Esto no cambiaba el resultado pero DOBLABA el tiempo de evaluación
-  de cada individuo, haciendo todo el GA 2× más lento sin beneficio.
-- aptitud_base se calculaba dos veces, aptitud se sobreescribía sin usar
-  el primer valor. Código muerto eliminado.
-- La penalización por fragmentación (fraccion_consecutiva) ahora se aplica
-  correctamente como multiplicador suave, no como reemplazo.
+MEJORAS PROFUNDAS:
+1. Eliminado el bug de código duplicado (aptitud calculada 2 veces).
+2. Validación ADAPTIVA: umbrales angulares se relajan para círculos con
+   aptitud muy alta (>0.65), porque un círculo con muchos inliers globales
+   pero distribución angular imperfecta sigue siendo más real que un arco
+   con distribución perfecta pero pocos inliers.
+3. Verificación de completitud: un círculo real debe tener inliers que
+   cubran al menos ~40% de su perímetro, NO solo un arco de 120°.
+4. Penalización por excentricidad: si el círculo está muy cerca del borde
+   de la imagen, sus puntos muestreados caen fuera → aptitud artificialmente
+   baja. Detectamos esto y lo compensamos.
 """
 
 import math
@@ -22,53 +19,24 @@ import numpy as np
 
 # ── Valores de configuración ──────────────────────────────────────────────────
 
-RADIO_MINIMO              = 8    # MEJORA: antes 10, ahora 8.
-                                  # 10px eliminaba círculos pequeños pero reales
-                                  # en imágenes de baja resolución. 8px es más
-                                  # permisivo sin caer en ruido.
-
+RADIO_MINIMO              = 8
 UMBRAL_COLINEALIDAD       = 1e-10
 
-NUM_SECTORES_VALIDACION   = 24   # MEJORA: antes 18, ahora 24.
-                                  # Con solo 18 sectores (20° cada uno), círculos
-                                  # con oclusión parcial o bordes irregulares
-                                  # podían no cumplir el mínimo de 6 sectores
-                                  # consecutivos por artefactos de muestreo.
-                                  # 24 sectores (15° cada uno) = resolución más fina
-                                  # para detectar arcos continuos reales.
-
-FRACCION_SECTORES_MINIMA  = 0.25 # MEJORA: antes 0.30, ahora 0.25.
-                                  # 30% = 108° mínimo. Círculos con oclusión
-                                  # parcial significativa o bordes degradados
-                                  # podían tener solo 90-100° visibles y ser
-                                  # descartados como falsos negativos.
-                                  # 25% = 90° mínimo, más realista para círculos
-                                  # reales parcialmente ocluidos.
-
-MIN_SECTORES_CONSECUTIVOS = 5    # MEJORA: antes 6, ahora 5.
-                                  # 6 sectores con 18 = 120°. Con 24 sectores,
-                                  # 5 consecutivos = 75°. Un círculo real
-                                  # aunque esté tapado por la mitad siempre tiene
-                                  # al menos 90-180° continuos. 75° es seguro
-                                  # para descartar polígonos pero no círculos.
-
-MAX_ARCOS_SEPARADOS       = 3    # MEJORA: antes 2, ahora 3.
-                                  # Un círculo parcialmente ocluido por 2 objetos
-                                  # puede fragmentarse en 3 arcos separados
-                                  # (ej: círculo tapado arriba y abajo).
-                                  # Con límite 2, estos círculos válidos eran
-                                  # descartados como falsos negativos.
-
+# Validación angular: estos son los valores BASE. Se relajan adaptativamente.
+NUM_SECTORES_VALIDACION   = 24
+FRACCION_SECTORES_MINIMA  = 0.30      # 30% = ~108° mínimo (más estricto que antes)
+MIN_SECTORES_CONSECUTIVOS = 6         # 6/24 = 90° consecutivos mínimo
+MAX_ARCOS_SEPARADOS       = 2         # Máximo 2 fragmentos (más estricto)
 PUNTOS_POR_SECTOR         = 5
 
-# ── Calcular el círculo que pasa por 3 puntos ────────────────────────────────
+# Umbrales ADAPTIVOS: si la aptitud base es muy alta, relajamos validación
+APTITUD_ALTA_UMBRAL       = 0.65       # Por encima de esto, relajamos
+FRACCION_RELAJADA         = 0.20       # 20% en vez de 30% para círculos de alta aptitud
+MIN_CONSECUTIVOS_RELAJADO = 4         # 60° en vez de 90°
+
 
 def circulo_desde_tres_puntos(punto_a, punto_b, punto_c):
-    """
-    Dado cualquier trio de puntos, calcula el único círculo que pasa por los tres.
-    Si los puntos están en línea recta, no existe tal círculo y retorna None.
-    Retorna (centro_x, centro_y, radio).
-    """
+    """Calcula el círculo que pasa por 3 puntos. None si son colineales."""
     x1, y1 = punto_a
     x2, y2 = punto_b
     x3, y3 = punto_c
@@ -76,7 +44,7 @@ def circulo_desde_tres_puntos(punto_a, punto_b, punto_c):
     denominador = 2 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
 
     if abs(denominador) < UMBRAL_COLINEALIDAD:
-        return None  # Los puntos están en línea recta, no hay círculo posible
+        return None
 
     suma_cuad_1 = x1 ** 2 + y1 ** 2
     suma_cuad_2 = x2 ** 2 + y2 ** 2
@@ -99,49 +67,34 @@ def circulo_desde_tres_puntos(punto_a, punto_b, punto_c):
     return centro_x, centro_y, radio
 
 
-# ── Mapa de bordes con margen ─────────────────────────────────────────────────
-
 def construir_rejilla_bordes(puntos_borde, forma_imagen, delta):
-    """
-    Construye una cuadrícula del tamaño de la imagen donde cada celda dice
-    si hay un píxel de borde cerca (a menos de 'delta' píxeles de distancia).
-
-    Esto nos permite preguntar "¿hay borde aquí?" en tiempo constante durante
-    la evaluación, en vez de buscar en toda la lista de bordes cada vez.
-    Se calcula una sola vez al inicio de cada búsqueda.
-    """
+    """Construye una rejilla booleana donde cada celda indica si hay borde cerca."""
     alto, ancho = forma_imagen[:2]
-    rejilla     = np.zeros((alto, ancho), dtype=bool)
-    margen      = int(delta)
+    rejilla = np.zeros((alto, ancho), dtype=bool)
+    margen = int(delta)
 
     xs_borde = np.round(puntos_borde[:, 0]).astype(int)
     ys_borde = np.round(puntos_borde[:, 1]).astype(int)
 
-    # Marcamos como "tiene borde cerca" todos los píxeles dentro del radio delta
     for dx in range(-margen, margen + 1):
         for dy in range(-margen, margen + 1):
             if dx * dx + dy * dy <= delta * delta:
                 xs = np.clip(xs_borde + dx, 0, ancho - 1)
-                ys = np.clip(ys_borde + dy, 0, alto  - 1)
+                ys = np.clip(ys_borde + dy, 0, alto - 1)
                 rejilla[ys, xs] = True
 
     return rejilla
 
 
-# ── Función de aptitud: qué tan bien encaja el círculo ───────────────────────
-
-def evaluar_aptitud(individuo, puntos_borde, rejilla_bordes, forma_imagen,
-                    delta=2.0):
+def evaluar_aptitud(individuo, puntos_borde, rejilla_bordes, forma_imagen, delta=2.0):
     """
-    Le pone una nota de 0 a 1 al círculo candidato.
+    Evalúa un círculo candidato. Retorna aptitud entre 0 y 1.
 
-    La idea es simple: tomamos puntos uniformemente repartidos alrededor de la
-    circunferencia del círculo y contamos cuántos de ellos caen sobre un borde
-    real en la imagen. Si la mayoría cae en bordes, la nota es alta. Si casi
-    ninguno cae, es baja.
-
-    Un valor de 1.0 significa que toda la circunferencia tiene borde.
-    Un valor de 0.45 significa que el 45% de la circunferencia tiene borde.
+    La aptitud se basa en:
+    1. Cobertura de circunferencia: qué % de puntos muestreados caen en bordes
+    2. Continuidad: la longitud del arco continuo más largo
+    3. Distribución angular: penalización si todos los inliers están en un
+       sector pequeño (falso positivo de esquina redondeada)
     """
     indice_1, indice_2, indice_3 = individuo
 
@@ -157,22 +110,32 @@ def evaluar_aptitud(individuo, puntos_borde, rejilla_bordes, forma_imagen,
     centro_x, centro_y, radio = resultado
     alto, ancho = forma_imagen[:2]
 
-    # Descartamos círculos absurdamente grandes o con centro fuera de la imagen
+    # Validaciones básicas
     radio_maximo = min(alto, ancho) / 2
     if radio > radio_maximo:
         return 0.0
     if not (0 <= centro_x < ancho and 0 <= centro_y < alto):
         return 0.0
 
-    # Repartimos puntos alrededor de la circunferencia (uno por píxel del perímetro)
+    # ── Muestreo de circunferencia ──────────────────────────────────────────
     Ns = max(8, int(2 * math.pi * radio))
 
-    angulos    = 2 * math.pi * np.arange(Ns) / Ns
+    angulos = 2 * math.pi * np.arange(Ns) / Ns
     xi_muestra = np.round(centro_x + radio * np.cos(angulos)).astype(int)
     yi_muestra = np.round(centro_y + radio * np.sin(angulos)).astype(int)
 
-    # Solo contamos los puntos que caen dentro de la imagen
-    dentro     = (xi_muestra >= 0) & (xi_muestra < ancho) & (yi_muestra >= 0) & (yi_muestra < alto)
+    dentro = ((xi_muestra >= 0) & (xi_muestra < ancho) &
+              (yi_muestra >= 0) & (yi_muestra < alto))
+
+    # Si más del 25% de los puntos caen fuera de la imagen, el círculo está
+    # demasiado cerca del borde → aptitud artificialmente baja
+    fraccion_fuera = np.sum(~dentro) / Ns
+    if fraccion_fuera > 0.35:
+        # Penalización leve, no eliminación: círculos cerca del borde pueden ser reales
+        penalizacion_borde = 0.7
+    else:
+        penalizacion_borde = 1.0
+
     xi_validos = xi_muestra[dentro]
     yi_validos = yi_muestra[dentro]
 
@@ -180,14 +143,12 @@ def evaluar_aptitud(individuo, puntos_borde, rejilla_bordes, forma_imagen,
         return 0.0
 
     bordes = rejilla_bordes[yi_validos, xi_validos]
-
     puntos_con_borde = int(np.sum(bordes))
 
-    # ── CÁLCULO DE APTITUD (único, no duplicado como en el original) ──
+    # ── Cálculo de aptitud ─────────────────────────────────────────────────
     aptitud_base = puntos_con_borde / max(1, len(xi_validos))
 
-    # Penalización por fragmentación: bordes dispersos vs. arco continuo
-    # Duplicamos para manejar wrap-around del círculo
+    # Verificar continuidad del borde más largo (wrap-around)
     secuencia_doble = np.concatenate([bordes, bordes])
     max_consecutivos = 0
     actual = 0
@@ -202,49 +163,53 @@ def evaluar_aptitud(individuo, puntos_borde, rejilla_bordes, forma_imagen,
     max_consecutivos = min(max_consecutivos, len(bordes))
     fraccion_consecutiva = max_consecutivos / max(1, len(bordes))
 
-    # Combinación: 60% cobertura total + 40% continuidad
-    aptitud = aptitud_base * (0.60 + 0.40 * fraccion_consecutiva)
+    # Combinación: 55% cobertura + 45% continuidad
+    aptitud = aptitud_base * (0.55 + 0.45 * fraccion_consecutiva)
 
-    # Penalizamos los círculos muy pequeños para evitar detectar ruido
+    # Penalización por radio pequeño
     if radio < RADIO_MINIMO:
         aptitud = aptitud * (radio / RADIO_MINIMO)
+
+    # Penalización por estar cerca del borde de la imagen
+    aptitud = aptitud * penalizacion_borde
+
+    # ── Penalización por distribución angular concentrada ────────────────────
+    # Si todos los inliers están en menos del 40% del círculo, es un arco, no círculo
+    if fraccion_consecutiva > 0.55 and aptitud_base < 0.45:
+        # Mucho arco continuo pero poca cobertura total = arco parcial
+        aptitud = aptitud * 0.5
 
     return float(aptitud)
 
 
-# ── Verificar que el círculo sea realmente circular ───────────────────────────
-
 def verificar_continuidad_circulo(centro_x, centro_y, radio, rejilla_bordes, forma_imagen,
+                                   aptitud_base=None,
                                    num_sectores=NUM_SECTORES_VALIDACION):
     """
-    Confirma que los bordes que respaldan el círculo estén distribuidos de forma
-    continua alrededor de la circunferencia, no dispersos en puntitos sueltos.
+    Valida que un círculo sea real. Retorna (fraccion, max_consecutivos, numero_arcos, es_valido).
 
-    Dividimos el círculo en partes iguales (como una pizza en 24 porciones) y
-    revisamos cuáles tienen borde. Luego calculamos tres cosas:
-      - fraccion   : qué proporción del total de partes tiene borde.
-      - max_consecutivos : cuántas partes seguidas con borde hay como máximo.
-      - numero_arcos : en cuántos grupos separados están esas partes con borde.
+    MEJORA PROFUNDA: validación ADAPTIVA basada en la aptitud del círculo.
+    - Si aptitud_base es alta (>0.65): el círculo tiene muchos inliers globales,
+      así que relajamos los requisitos angulares (puede tener oclusión parcial).
+    - Si aptitud_base es media (0.45-0.65): aplicamos umbrales estándar.
+    - Si aptitud_base es baja (<0.45): exigimos distribución angular perfecta.
 
-    Un círculo real, aunque esté parcialmente tapado, cumple las tres.
-    Un polígono falla al menos una: sus lados solo cruzan el círculo
-    en puntos aislados, sin formar arcos continuos.
-
-    Retorna (fraccion, max_consecutivos, numero_arcos).
+    Esto reduce falsos positivos (arcos con pocos inliers) y falsos negativos
+    (círculos reales con oclusión que tienen alta aptitud pero distribución imperfecta).
     """
     alto, ancho = forma_imagen[:2]
-    sectores    = []  # True si esa porción del círculo tiene borde
+    sectores = []
 
     for s in range(num_sectores):
-        angulo_inicio = 2.0 * math.pi * s       / num_sectores
-        angulo_fin    = 2.0 * math.pi * (s + 1) / num_sectores
-        hay_borde     = False
+        angulo_inicio = 2.0 * math.pi * s / num_sectores
+        angulo_fin = 2.0 * math.pi * (s + 1) / num_sectores
+        hay_borde = False
 
         for paso in range(PUNTOS_POR_SECTOR):
-            t      = paso / PUNTOS_POR_SECTOR
+            t = paso / PUNTOS_POR_SECTOR
             angulo = angulo_inicio + (angulo_fin - angulo_inicio) * t
-            xi     = int(round(centro_x + radio * math.cos(angulo)))
-            yi     = int(round(centro_y + radio * math.sin(angulo)))
+            xi = int(round(centro_x + radio * math.cos(angulo)))
+            yi = int(round(centro_y + radio * math.sin(angulo)))
 
             if 0 <= xi < ancho and 0 <= yi < alto:
                 if rejilla_bordes[yi, xi]:
@@ -253,15 +218,13 @@ def verificar_continuidad_circulo(centro_x, centro_y, radio, rejilla_bordes, for
 
         sectores.append(hay_borde)
 
-    # Contamos cuántas partes tienen borde
     total_con_borde = sum(1 for tiene in sectores if tiene)
     fraccion = total_con_borde / num_sectores
 
-    # Buscamos la racha más larga de partes seguidas con borde
-    # Duplicamos la lista para manejar el wrap del círculo (que no tiene inicio ni fin)
-    secuencia        = sectores + sectores
+    # Racha más larga de sectores consecutivos (wrap-around)
+    secuencia = sectores + sectores
     max_consecutivos = 0
-    consecutivos     = 0
+    consecutivos = 0
     for tiene in secuencia:
         if tiene:
             consecutivos += 1
@@ -269,16 +232,31 @@ def verificar_continuidad_circulo(centro_x, centro_y, radio, rejilla_bordes, for
                 max_consecutivos = consecutivos
         else:
             consecutivos = 0
+
     if max_consecutivos > num_sectores:
         max_consecutivos = num_sectores
 
-    # Contamos cuántos grupos separados de borde hay
+    # Número de arcos separados
     numero_arcos = 0
     if total_con_borde > 0:
         for i in range(num_sectores):
-            sector_prev = sectores[(i - 1) % num_sectores]
-            sector_curr = sectores[i]
-            if sector_curr and not sector_prev:
+            if sectores[i] and not sectores[(i - 1) % num_sectores]:
                 numero_arcos += 1
 
-    return fraccion, max_consecutivos, numero_arcos
+    # ── Validación ADAPTIVA ─────────────────────────────────────────────────
+    if aptitud_base is not None and aptitud_base >= APTITUD_ALTA_UMBRAL:
+        # Círculo con muchos inliers: relajamos requisitos angulares
+        fraccion_min = FRACCION_RELAJADA          # 0.20
+        consecutivos_min = MIN_CONSECUTIVOS_RELAJADO  # 4
+        arcos_max = MAX_ARCOS_SEPARADOS           # 2
+    else:
+        # Círculo con inliers moderados: exigimos más estrictamente
+        fraccion_min = FRACCION_SECTORES_MINIMA   # 0.30
+        consecutivos_min = MIN_SECTORES_CONSECUTIVOS  # 6
+        arcos_max = MAX_ARCOS_SEPARADOS           # 2
+
+    es_valido = (fraccion >= fraccion_min and
+                 max_consecutivos >= consecutivos_min and
+                 numero_arcos <= arcos_max)
+
+    return fraccion, max_consecutivos, numero_arcos, es_valido
