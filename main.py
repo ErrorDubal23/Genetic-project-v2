@@ -2,12 +2,11 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import json
-import numpy as np
 
 from image_utils import load_image_from_bytes, preprocess, get_edge_points, annotate_image, ndarray_to_b64
 from genetic_algorithm import GeneticCircleDetector
 
-app = FastAPI(title="CircleGA API v2")
+app = FastAPI(title="CircleGA API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,7 +37,7 @@ async def detect(
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    edge = preprocess(img, use_clahe=bool(p.get("use_clahe", False)))
+    edge = preprocess(img)
     edge_points = get_edge_points(edge)
 
     if len(edge_points) < 3:
@@ -50,28 +49,20 @@ async def detect(
         mutation_prob=float(p.get("mutation_prob", 0.10)),
         elite_count=int(p.get("elite_count", 2)),
         max_generations=int(p.get("max_generations", 500)),
-        min_radius=float(p.get("min_radius", 5.0)),
-        max_radius=float(p.get("max_radius")) if p.get("max_radius") is not None else None,
-        fitness_delta=float(p.get("fitness_delta", 2.0)),
-        nms_threshold=float(p.get("nms_threshold", 15.0)),
-        top_k=int(p.get("top_k", 1)),
-        fitness_threshold=float(p.get("fitness_threshold", 0.10)),
     )
 
-    # Pasar edge_map para que el GA precalcule Distance Transform una sola vez
-    result = detector.detect(edge_points, img.shape, edge_map=edge)
+    result = detector.detect(edge_points, img.shape, delta=float(p.get("delta", 2.0)))
 
     annotated = annotate_image(img, result["circles"])
     img_b64 = ndarray_to_b64(annotated)
 
-    # Error promedio sobre inliers del mejor círculo
     avg_error = 0.0
     if result["circles"]:
+        from fitness import circle_from_three_points
+        import numpy as np
         c = result["circles"][0]
         dists = np.sqrt((edge_points[:, 0] - c["x"])**2 + (edge_points[:, 1] - c["y"])**2)
-        inliers = np.abs(dists - c["r"]) <= detector.fitness_delta
-        if inliers.sum() > 0:
-            avg_error = float(np.mean(np.abs(dists[inliers] - c["r"])))
+        avg_error = float(np.mean(np.abs(dists - c["r"])))
 
     return JSONResponse({
         "circles": result["circles"],
