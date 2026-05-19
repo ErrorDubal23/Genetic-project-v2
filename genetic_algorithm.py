@@ -1,13 +1,33 @@
 """
 GA para detección de círculos – mejoras conservadoras sobre el código original.
 
-MEJORAS:
-1. Detección multi-círculo: extrae círculos secuenciales eliminando inliers
-   del círculo detectado, como propone el paper (Sección 3.1.4).
-2. Cromosomas sin repetición: evita individuos degenerados como (5,5,8).
-3. Canonicalización: ordena i≤j≤k para que (3,5,8)=(5,3,8), reduciendo
-   el espacio de búsqueda ~6×.
-4. Evaluación de offspring 1 sola vez por generación (antes se evaluaba 2×).
+MEJORAS respecto al código original:
+1. Canonicalización de cromosomas: ordena i≤j≤k.
+   El original trataba (3,5,8), (5,3,8), (8,5,3) como 6 individuos distintos
+   que codifican el MISMO círculo. Esto desperdicia evaluaciones y ralentiza
+   la convergencia. Ahora son un solo individuo → espacio 6× más pequeño.
+
+2. Población sin índices repetidos: evita (5,5,8) degenerados.
+   El original usaba np.random.randint que permitía repeticiones.
+   Un círculo definido por dos puntos iguales + uno distinto es colineal
+   o degenerado, fitness=0, evaluación desperdiciada.
+
+3. Evaluación de offspring 1 sola vez por generación.
+   El original evaluaba offspring 2 veces: una implícita en el crossover
+   (no, espera, revisemos...)
+   
+   En el original:
+   - offspring = crossover(selected)
+   - offspring = mutate(offspring)
+   - worst_idx = np.argsort(_evaluate(offspring, ...))[:elite]
+   
+   Evalúa offspring completo SOLO para encontrar los peores. Costoso.
+   Ahora guardamos las fitness del offspring y reutilizamos.
+
+4. Detección multi-círculo: ejecuta GA secuencialmente eliminando inliers.
+   El original solo devolvía el mejor círculo. Ahora detecta hasta top_k
+   círculos ejecutando el GA repetidamente y "consumiendo" los edge_points
+   que ya fueron explicados por un círculo detectado.
 """
 import numpy as np
 from fitness import evaluate_fitness, circle_from_three_points
@@ -22,7 +42,7 @@ class GeneticCircleDetector:
         elite_count: int = 2,
         max_generations: int = 500,
         top_k: int = 5,
-        fitness_threshold: float = 0.01,
+        fitness_threshold: float = 0.05,
     ):
         self.pop_size = population_size
         self.pc = crossover_prob
@@ -38,7 +58,7 @@ class GeneticCircleDetector:
         pop = np.zeros((self.pop_size, 3), dtype=np.int64)
         for i in range(self.pop_size):
             pop[i] = np.random.choice(n_points, size=3, replace=False)
-        return pop
+        return self._canonicalize(pop)
 
     def _canonicalize(self, pop):
         """Ordena genes i≤j≤k para eliminar simetría de permutación."""
@@ -79,25 +99,6 @@ class GeneticCircleDetector:
                 else:
                     pop[i, gene] = np.random.randint(n_points)
         return self._canonicalize(pop)
-
-    def _nms(self, candidates):
-        """Supresión no-máxima: conserva círculos no superpuestos en posición+radio."""
-        if not candidates:
-            return []
-        candidates = sorted(candidates, key=lambda x: x["fitness"], reverse=True)
-        keep = []
-        for c in candidates:
-            dup = False
-            for k in keep:
-                d = np.hypot(c["x"] - k["x"], c["y"] - k["y"])
-                if d < 15 or abs(c["r"] - k["r"]) < 10:
-                    dup = True
-                    break
-            if not dup:
-                keep.append(c)
-                if len(keep) >= self.top_k:
-                    break
-        return keep
 
     # ------------------------------------------------------------------
     def _run_ga(self, edge_points, img_shape, delta):
@@ -177,5 +178,18 @@ class GeneticCircleDetector:
             inliers = dists <= delta * 2.5  # margen generoso para no fragmentar círculos
             remaining = remaining[~inliers]
 
-        all_circles = self._nms(all_circles)
+        # NMS simple: quedarse con círculos no superpuestos
+        if len(all_circles) > 1:
+            filtered = [all_circles[0]]
+            for c in all_circles[1:]:
+                dup = False
+                for k in filtered:
+                    d = np.hypot(c["x"] - k["x"], c["y"] - k["y"])
+                    if d < 15 or abs(c["r"] - k["r"]) < 10:
+                        dup = True
+                        break
+                if not dup:
+                    filtered.append(c)
+            all_circles = filtered
+
         return {"circles": all_circles, "best_fitness": round(float(global_best), 4)}
