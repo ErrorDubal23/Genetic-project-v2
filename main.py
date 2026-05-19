@@ -38,7 +38,7 @@ async def detect(
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    edge = preprocess(img)
+    edge = preprocess(img, use_clahe=bool(p.get("use_clahe", False)))
     edge_points = get_edge_points(edge)
 
     if len(edge_points) < 3:
@@ -50,26 +50,26 @@ async def detect(
         mutation_prob=float(p.get("mutation_prob", 0.10)),
         elite_count=int(p.get("elite_count", 2)),
         max_generations=int(p.get("max_generations", 500)),
-        min_radius=float(p.get("min_radius", 8.0)),
+        min_radius=float(p.get("min_radius", 5.0)),
         max_radius=float(p.get("max_radius")) if p.get("max_radius") is not None else None,
-        fitness_delta=float(p.get("fitness_delta", 1.5)),
-        min_circumference_ratio=float(p.get("min_circumference_ratio", 0.55)),
+        fitness_delta=float(p.get("fitness_delta", 2.0)),
         nms_threshold=float(p.get("nms_threshold", 15.0)),
-        top_k=int(p.get("top_k", 5)),
-        occlusion_penalty=float(p.get("occlusion_penalty", 0.15)),
+        top_k=int(p.get("top_k", 1)),
+        fitness_threshold=float(p.get("fitness_threshold", 0.10)),
     )
 
-    result = detector.detect(edge_points, img.shape)
+    # Pasar edge_map para que el GA precalcule Distance Transform una sola vez
+    result = detector.detect(edge_points, img.shape, edge_map=edge)
 
     annotated = annotate_image(img, result["circles"])
     img_b64 = ndarray_to_b64(annotated)
 
-    # Métrica de calidad: error promedio de inliers respecto al radio
+    # Error promedio sobre inliers del mejor círculo
     avg_error = 0.0
     if result["circles"]:
         c = result["circles"][0]
         dists = np.sqrt((edge_points[:, 0] - c["x"])**2 + (edge_points[:, 1] - c["y"])**2)
-        inliers = np.abs(dists - c["r"]) <= c.get("delta", 1.5)
+        inliers = np.abs(dists - c["r"]) <= detector.fitness_delta
         if inliers.sum() > 0:
             avg_error = float(np.mean(np.abs(dists[inliers] - c["r"])))
 
