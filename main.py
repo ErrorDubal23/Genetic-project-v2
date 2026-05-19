@@ -51,7 +51,7 @@ async def detect(
         elite_count=int(p.get("elite_count", 2)),
         max_generations=int(p.get("max_generations", 500)),
         min_radius=float(p.get("min_radius", 8.0)),
-        max_radius=float(p.get("max_radius", None)),
+        max_radius=float(p.get("max_radius")) if p.get("max_radius") is not None else None,
         fitness_delta=float(p.get("fitness_delta", 1.5)),
         min_circumference_ratio=float(p.get("min_circumference_ratio", 0.55)),
         nms_threshold=float(p.get("nms_threshold", 15.0)),
