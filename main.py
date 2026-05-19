@@ -2,11 +2,12 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import json
+import numpy as np
 
 from image_utils import load_image_from_bytes, preprocess, get_edge_points, annotate_image, ndarray_to_b64
 from genetic_algorithm import GeneticCircleDetector
 
-app = FastAPI(title="CircleGA API")
+app = FastAPI(title="CircleGA API v2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,6 +50,8 @@ async def detect(
         mutation_prob=float(p.get("mutation_prob", 0.10)),
         elite_count=int(p.get("elite_count", 2)),
         max_generations=int(p.get("max_generations", 500)),
+        top_k=int(p.get("top_k", 5)),
+        fitness_threshold=float(p.get("fitness_threshold", 0.05)),
     )
 
     result = detector.detect(edge_points, img.shape, delta=float(p.get("delta", 2.0)))
@@ -56,13 +59,16 @@ async def detect(
     annotated = annotate_image(img, result["circles"])
     img_b64 = ndarray_to_b64(annotated)
 
+    # MEJORA: error promedio solo sobre inliers (no sobre todos los edge_points)
+    # El original calculaba sobre TODOS los puntos, incluyendo bordes de otros
+    # objetos que distorsionaban la métrica.
     avg_error = 0.0
     if result["circles"]:
-        from fitness import circle_from_three_points
-        import numpy as np
         c = result["circles"][0]
         dists = np.sqrt((edge_points[:, 0] - c["x"])**2 + (edge_points[:, 1] - c["y"])**2)
-        avg_error = float(np.mean(np.abs(dists - c["r"])))
+        inliers = np.abs(dists - c["r"]) <= float(p.get("delta", 2.0))
+        if inliers.sum() > 0:
+            avg_error = float(np.mean(np.abs(dists[inliers] - c["r"])))
 
     return JSONResponse({
         "circles": result["circles"],
